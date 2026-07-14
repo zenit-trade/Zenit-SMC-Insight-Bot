@@ -1,7 +1,7 @@
 import datetime as dt
 import pytz
 from sqlalchemy import and_
-from app.models import SessionLocal, Trade, Status
+from models import SessionLocal, Trade, Status
 
 IST = pytz.timezone("Asia/Kolkata")
 

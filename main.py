@@ -6,8 +6,8 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from app.models import init_db, SessionLocal, Trade, Direction, Status
-from app import analytics
+from models import init_db, SessionLocal, Trade, Direction, Status
+import analytics
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("zenit-analytics-bot")
