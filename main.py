@@ -5,6 +5,7 @@ import datetime as dt
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
+from sqlalchemy.exc import IntegrityError
 
 from models import init_db, SessionLocal, Trade, Direction, Status
 import analytics
@@ -113,6 +114,19 @@ async def tradingview_webhook(request: Request):
             raise HTTPException(status_code=400, detail="signal_id is required for this alert type")
 
         if alert_type == "ENTRY":
+            # TradingView retries webhook deliveries that appear to have
+            # failed (timeouts, transient errors, etc). That means the SAME
+            # signal_id can legitimately arrive more than once. Treat that
+            # as a no-op instead of crashing: check first, and also guard
+            # the insert itself against a race between the check and the
+            # commit (two near-simultaneous retries).
+            existing = session.query(Trade).filter(Trade.signal_id == signal_id).first()
+            if existing:
+                log.info("Duplicate ENTRY for signal_id=%s — resending Telegram message only", signal_id)
+                if pine_text:
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                return {"ok": True, "duplicate": True}
+
             direction = payload["direction"].upper()
             entry = float(payload["entry"])
             sl = float(payload["sl"])
@@ -129,7 +143,13 @@ async def tradingview_webhook(request: Request):
                 status=Status.OPEN,
             )
             session.add(trade)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                # Another concurrent retry inserted it a moment ago — fine,
+                # the trade is logged either way. Don't crash, just move on.
+                session.rollback()
+                log.info("Race-condition duplicate insert for signal_id=%s, ignoring", signal_id)
 
             msg = pine_text or f"⚡ {direction} {symbol}\nEntry: {entry}\nSL: {sl}\nTP: {tp}"
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
@@ -141,6 +161,14 @@ async def tradingview_webhook(request: Request):
                 if pine_text:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
                 return {"ok": False, "reason": "no matching trade"}
+
+            if trade.status != Status.OPEN:
+                # Already closed by an earlier delivery of this same alert —
+                # just resend the Telegram confirmation, don't re-close it.
+                log.info("Duplicate %s for already-closed signal_id=%s", alert_type, signal_id)
+                if pine_text:
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                return {"ok": True, "duplicate": True}
 
             trade.status = Status.TP_HIT if alert_type == "TP_HIT" else Status.SL_HIT
             trade.closed_at = dt.datetime.utcnow()
