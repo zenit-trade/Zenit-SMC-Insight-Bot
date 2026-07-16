@@ -4,6 +4,7 @@ import datetime as dt
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, Bot
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy.exc import IntegrityError
 
@@ -21,6 +22,17 @@ APP_URL = os.environ["APP_URL"]  # e.g. https://your-app.up.railway.app (Railway
 app = FastAPI()
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 bot = Bot(token=TELEGRAM_TOKEN)
+
+
+async def safe_send(text: str, parse_mode: str = "HTML"):
+    """Send a Telegram message without letting delivery failures (bot
+    blocked, chat deleted, rate limits, etc.) crash the webhook handler.
+    The trade is still logged in the DB either way — this only affects
+    the notification, not the trade record."""
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=parse_mode)
+    except TelegramError as e:
+        log.warning("Telegram delivery failed (%s) — continuing anyway: %s", type(e).__name__, e)
 
 
 # ---------- Telegram commands ----------
@@ -107,7 +119,7 @@ async def tradingview_webhook(request: Request):
         if alert_type == "SETUP_INCOMING":
             # Informational only — nothing to log, just forward to Telegram.
             if pine_text:
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                await safe_send(pine_text)
             return {"ok": True}
 
         if not signal_id:
@@ -124,7 +136,7 @@ async def tradingview_webhook(request: Request):
             if existing:
                 log.info("Duplicate ENTRY for signal_id=%s — resending Telegram message only", signal_id)
                 if pine_text:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                    await safe_send(pine_text)
                 return {"ok": True, "duplicate": True}
 
             direction = payload["direction"].upper()
@@ -152,14 +164,14 @@ async def tradingview_webhook(request: Request):
                 log.info("Race-condition duplicate insert for signal_id=%s, ignoring", signal_id)
 
             msg = pine_text or f"⚡ {direction} {symbol}\nEntry: {entry}\nSL: {sl}\nTP: {tp}"
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
+            await safe_send(msg)
 
         elif alert_type in ("TP_HIT", "SL_HIT"):
             trade = session.query(Trade).filter(Trade.signal_id == signal_id).first()
             if not trade:
                 log.warning("No matching OPEN trade for signal_id=%s", signal_id)
                 if pine_text:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                    await safe_send(pine_text)
                 return {"ok": False, "reason": "no matching trade"}
 
             if trade.status != Status.OPEN:
@@ -167,7 +179,7 @@ async def tradingview_webhook(request: Request):
                 # just resend the Telegram confirmation, don't re-close it.
                 log.info("Duplicate %s for already-closed signal_id=%s", alert_type, signal_id)
                 if pine_text:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=pine_text, parse_mode="HTML")
+                    await safe_send(pine_text)
                 return {"ok": True, "duplicate": True}
 
             trade.status = Status.TP_HIT if alert_type == "TP_HIT" else Status.SL_HIT
@@ -176,7 +188,7 @@ async def tradingview_webhook(request: Request):
             session.commit()
 
             msg = pine_text or f"{'🎯 TP HIT' if alert_type == 'TP_HIT' else '🛑 SL HIT'}\n{trade.symbol} {trade.direction.value}\nExit: {trade.exit_price}"
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
+            await safe_send(msg)
 
         else:
             raise HTTPException(status_code=400, detail=f"unknown type: {alert_type}")
